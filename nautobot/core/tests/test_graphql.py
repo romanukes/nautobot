@@ -29,6 +29,7 @@ from nautobot.core.graphql.schema import (
     extend_schema_type_config_context,
     extend_schema_type_relationships,
     extend_schema_type_null_field_choice,
+    extend_schema_type_computed_field,
 )
 from nautobot.dcim.choices import InterfaceTypeChoices, InterfaceModeChoices
 from nautobot.dcim.filters import DeviceFilterSet, SiteFilterSet
@@ -38,6 +39,7 @@ from nautobot.extras.choices import CustomFieldTypeChoices
 from nautobot.utilities.testing.utils import create_test_user
 
 from nautobot.extras.models import (
+    ComputedField,
     ChangeLoggedModel,
     CustomField,
     ConfigContext,
@@ -153,6 +155,16 @@ class GraphQLExtendSchemaType(TestCase):
 
         obj_type = ContentType.objects.get_for_model(Site)
 
+        # Create computed field for Site objects
+        self.computed_field = ComputedField.objects.create(
+            content_type=obj_type,
+            slug="computed_field",
+            label="Computed Field",
+            template="{{ obj.name }} is awesome!",
+            fallback_value="This template has errored",
+            weight=100,
+        )
+
         # Create custom fields for Site objects
         for data in self.datas:
             cf = CustomField.objects.create(type=data["field_type"], name=data["field_name"], required=False)
@@ -186,6 +198,30 @@ class GraphQLExtendSchemaType(TestCase):
         for data in self.datas:
             field_name = str_to_var_name(data["field_name"])
             self.assertIn(field_name, schema._meta.fields.keys())
+
+    @override_settings(GRAPHQL_COMPUTED_FIELD_PREFIX="pr")
+    def test_extend_computed_field_w_prefix(self):
+
+        schema = extend_schema_type_computed_field(self.schema, Site)
+
+        field_name = f"pr_{self.computed_field.slug}"
+        self.assertIn(field_name, schema._meta.fields.keys())
+
+    @override_settings(GRAPHQL_COMPUTED_FIELD_PREFIX="")
+    def test_extend_computed_field_wo_prefix(self):
+
+        schema = extend_schema_type_computed_field(self.schema, Site)
+
+        field_name = self.computed_field.slug
+        self.assertIn(field_name, schema._meta.fields.keys())
+
+    @override_settings(GRAPHQL_COMPUTED_FIELD_PREFIX=None)
+    def test_extend_computed_field_prefix_none(self):
+
+        schema = extend_schema_type_computed_field(self.schema, Site)
+
+        field_name = self.computed_field.slug
+        self.assertIn(field_name, schema._meta.fields.keys())
 
     def test_extend_tags_enabled(self):
 
@@ -553,7 +589,7 @@ class GraphQLQueryTest(TestCase):
         self.request.user = self.user
 
         self.backend = get_default_backend()
-        self.schema = graphene_settings.SCHEMA
+        # self.schema = graphene_settings.SCHEMA
 
         # Populate Data
         manufacturer = Manufacturer.objects.create(name="Manufacturer 1", slug="manufacturer-1")
@@ -690,6 +726,64 @@ class GraphQLQueryTest(TestCase):
             address="1.1.1.1/32", status=self.status1, assigned_object=self.vminterface
         )
 
+        good_computed_field = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="good_computed_field",
+            label="Good Computed Field",
+            template="{{ obj.name }} is awesome!",
+            fallback_value="This template has errored",
+            weight=100,
+        )
+        good_computed_field_wo_fallback_value = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="good_computed_field_wo_fallback_value",
+            label="Good Computed Field w/o Fallback Value",
+            template="{{ obj.name }} is awesome!",
+            weight=100,
+        )
+        good_computed_field_w_filter = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="good_computed_field_w_filter",
+            label="Good Computed Field w/ Filter",
+            template="{{ obj.name | upper }}",
+            fallback_value="This template has errored",
+            weight=100,
+        )
+        good_computed_field_w_context = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="good_computed_field_w_context",
+            label="Good Computed Field w/ Context",
+            template="{{ obj.name ~ ' at ' ~  obj.site.name }}",
+            fallback_value="This template has errored",
+            weight=100,
+        )
+        bad_computed_field = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="bad_computed_field",
+            label="Bad Computed Field",
+            template="{{ not_in_context | not_a_filter }} is horrible!",
+            fallback_value="An error occurred while rendering this template.",
+            weight=50,
+        )
+        bad_computed_field_wo_fallback_value = ComputedField.objects.create(
+            content_type=ContentType.objects.get_for_model(Device),
+            slug="bad_computed_field_wo_fallback_value",
+            label="Blank Fallback Value w/o Fallback Value",
+            template="{{ not_in_context }}",
+            weight=50,
+        )
+
+        self.cpf_data = (
+            (good_computed_field, "Device 1 is awesome!"),
+            (good_computed_field_wo_fallback_value, "Device 1 is awesome!"),
+            (good_computed_field_w_filter, "DEVICE 1"),
+            (good_computed_field_w_context, "Device 1 at Site-1"),
+            (bad_computed_field, "An error occurred while rendering this template."),
+            (bad_computed_field_wo_fallback_value, ""),
+        )
+
+        self.schema = graphene_settings.SCHEMA
+
     def execute_query(self, query, variables=None):
 
         document = self.backend.document_from_string(self.schema, query)
@@ -726,6 +820,25 @@ class GraphQLQueryTest(TestCase):
         custom_field_data = [item["_custom_field_data"] for item in result.data["devices"]]
         self.assertIsInstance(custom_field_data[0], dict)
         self.assertEqual(custom_field_data[0], {})
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_computed_field_data(self):
+
+        for field, expected_results in self.cpf_data:
+            with self.subTest(msg=f"Checking {field.slug}", field=field, expected_results=expected_results):
+                query = f'query {{ devices(name: "Device 1") {{ name cpf_{field.slug} }} }}'
+
+                result = self.execute_query(query)
+
+                self.assertEqual(result.errors, None)
+
+                self.assertIsInstance(result.data["devices"], list)
+                device_names = [item["name"] for item in result.data["devices"]]
+                self.assertEqual(device_names, ["Device 1"])
+
+                computed_field_data = result.data["devices"][0][f"cpf_{field.slug}"]
+                self.assertIsInstance(computed_field_data, str)
+                self.assertEqual(computed_field_data, expected_results)
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_device_role_filter(self):
